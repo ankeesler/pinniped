@@ -4,21 +4,24 @@
 package impersonator
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 
 	"github.com/go-logr/logr"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 
 	"go.pinniped.dev/generated/1.20/apis/concierge/login"
 	loginv1alpha1 "go.pinniped.dev/generated/1.20/apis/concierge/login/v1alpha1"
+	"go.pinniped.dev/internal/constable"
 	"go.pinniped.dev/internal/controller/authenticator/authncache"
 )
 
@@ -80,24 +83,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"method", r.Method,
 	)
 
-	tokenCredentialReq, err := extractToken(r)
-	if err != nil {
-		log.Error(err, "invalid token encoding")
-		http.Error(w, "invalid token encoding", http.StatusBadRequest)
+	// Never mutate request (see http.Handler docs).
+	//
+	// Note that call bearertoken.Authenticator will delete the Authorization header for safety, so we
+	// need to clone the http.Request here.
+	r = r.Clone(r.Context())
+
+	userInfo, httpErr := authenticate(r, p.cache, &log)
+	if httpErr != nil {
+		http.Error(w, httpErr.message, httpErr.code)
 		return
 	}
-	log = log.WithValues(
-		"authenticator", tokenCredentialReq.Spec.Authenticator,
-		"authenticatorNamespace", tokenCredentialReq.Namespace,
-	)
-
-	userInfo, err := p.cache.AuthenticateTokenCredentialRequest(r.Context(), tokenCredentialReq)
-	if err != nil {
-		log.Error(err, "received invalid token")
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return
-	}
-
 	if userInfo == nil {
 		log.Info("received token that did not authenticate")
 		http.Error(w, "not authenticated", http.StatusUnauthorized)
@@ -105,12 +101,60 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	log = log.WithValues("userID", userInfo.GetUID())
 
-	// Never mutate request (see http.Handler docs).
-	newR := r.WithContext(r.Context())
-	newR.Header = getProxyHeaders(userInfo, r.Header)
+	r.Header = getProxyHeaders(userInfo, r.Header)
 
 	log.Info("proxying authenticated request")
-	p.proxy.ServeHTTP(w, newR)
+	p.proxy.ServeHTTP(w, r)
+}
+
+type httpErr struct {
+	message string
+	code    int
+}
+
+func (h *httpErr) Error() string {
+	return h.message
+}
+
+type authenticateTokenFunc func(ctx context.Context, token string) (*authenticator.Response, bool, error)
+
+func (f authenticateTokenFunc) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+	return f(ctx, token)
+}
+
+func authenticate(r *http.Request, cache *authncache.Cache, log *logr.Logger) (user.Info, *httpErr) {
+	a := bearertoken.New(authenticateTokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+		tokenCredentialReq, err := extractToken(token)
+		if err != nil {
+			(*log).Error(err, "invalid token encoding")
+			return nil, false, &httpErr{message: "invalid token encoding", code: http.StatusBadRequest}
+		}
+		*log = (*log).WithValues(
+			"authenticator", tokenCredentialReq.Spec.Authenticator,
+			"authenticatorNamespace", tokenCredentialReq.Namespace,
+		)
+
+		userInfo, err := cache.AuthenticateTokenCredentialRequest(r.Context(), tokenCredentialReq)
+		if err != nil {
+			(*log).Error(err, "received invalid token")
+			return nil, false, &httpErr{message: "invalid token", code: http.StatusUnauthorized}
+		}
+
+		return &authenticator.Response{User: userInfo}, true, nil
+	}))
+	resp, authenticated, err := a.AuthenticateRequest(r)
+	if err != nil {
+		if httpErr, ok := err.(*httpErr); ok {
+			return nil, httpErr
+		}
+		return nil, &httpErr{message: "unexpected error", code: http.StatusInternalServerError}
+	}
+	if !authenticated {
+		err := &httpErr{message: "invalid token encoding", code: http.StatusBadRequest}
+		(*log).Error(constable.Error("missing bearer token"), err.message)
+		return nil, err
+	}
+	return resp.User, nil
 }
 
 func getProxyHeaders(userInfo user.Info, requestHeaders http.Header) http.Header {
@@ -128,15 +172,7 @@ func getProxyHeaders(userInfo user.Info, requestHeaders http.Header) http.Header
 	return newHeaders
 }
 
-func extractToken(req *http.Request) (*login.TokenCredentialRequest, error) {
-	authHeader := req.Header.Get("Authorization")
-	if authHeader == "" {
-		return nil, fmt.Errorf("missing authorization header")
-	}
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return nil, fmt.Errorf("authorization header must be of type Bearer")
-	}
-	encoded := strings.TrimPrefix(authHeader, "Bearer ")
+func extractToken(encoded string) (*login.TokenCredentialRequest, error) {
 	tokenCredentialRequestJSON, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("invalid base64 in encoded bearer token: %w", err)
