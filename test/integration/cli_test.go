@@ -23,8 +23,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/square/go-jose.v2"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	clientauthenticationv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
 
+	identityv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/identity/v1alpha1"
+	conciergescheme "go.pinniped.dev/internal/concierge/scheme"
 	"go.pinniped.dev/internal/testutil"
 	"go.pinniped.dev/pkg/oidcclient"
 	"go.pinniped.dev/pkg/oidcclient/filesession"
@@ -95,6 +99,19 @@ func TestCLIGetKubeconfigStaticToken(t *testing.T) {
 				group := group
 				t.Run("access as group "+group+" with client-go", library.AccessAsGroupTest(ctx, group, kubeClient))
 			}
+
+			// Validate that `pinniped whoami` returns the correct identity.
+			kubeconfigPath := filepath.Join(testutil.TempDir(t), "whoami-kubeconfig")
+			require.NoError(t, ioutil.WriteFile(kubeconfigPath, []byte(stdout), 0600))
+			assertWhoami(
+				ctx,
+				t,
+				false,
+				pinnipedExe,
+				kubeconfigPath,
+				env.TestUser.ExpectedUsername,
+				append(env.TestUser.ExpectedGroups, "system:authenticated"),
+			)
 		})
 	}
 }
@@ -107,6 +124,49 @@ func runPinnipedCLI(t *testing.T, pinnipedExe string, args ...string) (string, s
 	cmd.Stderr = &stderr
 	require.NoErrorf(t, cmd.Run(), "stderr:\n%s\n\nstdout:\n%s\n\n", stderr.String(), stdout.String())
 	return stdout.String(), stderr.String()
+}
+
+func assertWhoami(ctx context.Context, t *testing.T, useProxy bool, pinnipedExe, kubeconfigPath, wantUsername string, wantGroups []string) {
+	t.Helper()
+
+	apiGroupSuffix := library.IntegrationEnv(t).APIGroupSuffix
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(
+		ctx,
+		pinnipedExe,
+		"whoami",
+		"--kubeconfig",
+		kubeconfigPath,
+		"--output",
+		"yaml",
+		"--api-group-suffix",
+		apiGroupSuffix,
+	)
+	if useProxy {
+		cmd.Env = append(os.Environ(), library.IntegrationEnv(t).ProxyEnv()...)
+	}
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	require.NoErrorf(t, cmd.Run(), "stderr:\n%s\n\nstdout:\n%s\n\n", stderr.String(), stdout.String())
+
+	whoAmI := deserializeWhoAmIRequest(t, stdout.String(), apiGroupSuffix)
+	require.Equal(t, wantUsername, whoAmI.Status.KubernetesUserInfo.User.Username)
+	require.ElementsMatch(t, wantGroups, whoAmI.Status.KubernetesUserInfo.User.Groups)
+}
+
+func deserializeWhoAmIRequest(t *testing.T, data string, apiGroupSuffix string) *identityv1alpha1.WhoAmIRequest {
+	t.Helper()
+
+	scheme, _, _ := conciergescheme.New(apiGroupSuffix)
+	codecs := serializer.NewCodecFactory(scheme)
+	respInfo, ok := runtime.SerializerInfoForMediaType(codecs.SupportedMediaTypes(), runtime.ContentTypeYAML)
+	require.True(t, ok)
+
+	obj, err := runtime.Decode(respInfo.Serializer, []byte(data))
+	require.NoError(t, err)
+
+	return obj.(*identityv1alpha1.WhoAmIRequest)
 }
 
 func TestCLILoginOIDC(t *testing.T) {
